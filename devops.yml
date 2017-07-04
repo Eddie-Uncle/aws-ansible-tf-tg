@@ -11,27 +11,17 @@
       image: "ami-66073f70"
       count: 1
       bucketname: "jdir-devops"
-      securitygroup: "sg-6127bc19"
+      securitygroup: "sg-76ca820b"
       instancetype: "t2.micro"
       keypair: "devops"
       webappsdir: "/var/www/html/"
 
     tasks:
-      - name: Download file
-        s3:
-             bucket: "{{ bucketname }}"
-             object: "{{ file }}"
-             dest: "./files/{{ file }}"
-             mode: get
-             region: "us-east-1"
-        tags:
-          - html
-
       - name: Start the prototype
-        shell: aws ec2 run-instances --image-id "{{ image}}" --count {{ count }} --instance-type "{{ instancetype}}" --key-name "{{ keypair}}" --query 'Instances[*].InstanceId' --output text
+        shell: aws ec2 run-instances --image-id "{{ image}}" --count {{ count }} --instance-type "{{ instancetype}}" --key-name "{{ keypair}}" --security-group-ids "{{ securitygroup }}" --query 'Instances[*].InstanceId' --iam-instance-profile Name="s3access-profile" --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=test-prototype}]' --output text
         register: instanceid
       
-      - debug: var=instanceid
+      - debug: msg={{ instanceid.stdout }}
 
       - name: ec2 wait instance-running
         shell: aws ec2 wait instance-running --instance-ids "{{ instanceid.stdout }}"
@@ -39,22 +29,44 @@
       - name: Get pub ip
         shell: aws ec2 describe-instances --instance-ids "{{ instanceid.stdout }}" --query 'Reservations[*].Instances[*].PublicIpAddress' --output text
         register: pubip
-
-      - debug: var=pubip
+      
+      - debug: msg={{ pubip.stdout }}
 
       - add_host:
-          name: "{{ pubip }}"
+          name: "{{ pubip.stdout }}"
           groups: liveserver
 
+      - name: Wait for SSH port come up
+        wait_for:
+          host: "{{ pubip.stdout }}"
+          port: 22
+          delay: 5
+          state: started
+
   - hosts: liveserver
+    remote_user: ec2-user
+    sudo: yes
     gather_facts: False
+    vars:
+      bucketname: "jdir-devops"
+      webappsdir: "/var/www/html/"
+      file: "devops/index.html"
     tasks:
-      - name: Copy file to web server
-        win_copy:
-            src: "./files/{{ file }}"
-            dest: "{{ webappsdir }}"
+      - name: Download file
+        s3:
+             bucket: "{{ bucketname }}"
+             object: "{{ file }}"
+             dest: "{{webappsdir}}{{ file | basename }}"
+             mode: get
+             region: "us-east-1"
         tags:
           - html
+
+      - name: Restart httpd service and enable on boot
+        service:
+          name: httpd
+          state: started
+          enabled: yes
 
   - hosts: localhost
     connection: local
@@ -62,28 +74,31 @@
     tasks:
 
       - name: Stop the instance, for creating the image
-        shell: aws ec2 stop-instances --instance-ids "{{ instanceid }}"
-
-      - name: Wait for instance to shutdown
-        pause:
-          minutes: 1
+        shell: aws ec2 stop-instances --instance-ids "{{ instanceid.stdout }}"
 
       - name: ec2 wait instance-stopped
-        shell: aws ec2 wait instance-stopped --instance-ids "{{ instanceid }}"
+        shell: aws ec2 wait instance-stopped --instance-ids "{{ instanceid.stdout }}"
 
-      - name: Bake AMI
-        shell: aws ec2 create-image --instance-id "{{ instanceid }}" --name "{{lookup('pipe','date +%Y%m%d%H%M%S')}}" --output text
+      - name: Creating AMI
+        shell: aws ec2 create-image --instance-id "{{ instanceid.stdout }}" --name "{{lookup('pipe','date +%Y%m%d%H%M%S')}}" --output text
         register: newami
 
-      - debug: msg={{ (newami.stdout | from_json).ImageId }}
-
-      - name: "AWS Create-Image called, waiting for new AMI to be ready"
-        pause:
-          minutes: 5
+      - debug: msg={{ newami.stdout }}
 
       - name: Wait for new ami
-        command: aws ec2 wait image-available --image-ids {{ newami }}
+        command: aws ec2 wait image-available --image-ids {{ newami.stdout }}
+
+      - name: Terminate prototype instance
+        command: aws ec2 terminate-instances --instance-ids "{{ instanceid.stdout }}"
+
+#      - name: Deregister previous AMI
+#        command: aws ec2 deregister-image --image-id "{{ image }}"
 
       - name: Terraform plan
-        command: terragrunt plan -var {{ newami }} -no-color
+        command: terragrunt plan -var 'newami={{ newami.stdout }}' -no-color
 
+      - name: Terraform apply 
+        command: terragrunt apply -var 'newami={{ newami.stdout }}' -no-color
+        register: apply
+
+      - debug: msg={{ apply.stdout_lines }}
