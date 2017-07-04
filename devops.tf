@@ -40,6 +40,10 @@ resource "aws_instance" "test-terraform" {
   key_name	 	= "${var.keyname}"
   security_groups 	= "${var.securitygroups}"
   availability_zone	= "${var.azs}"
+
+  tags {
+    Name = "web-instance"
+  }
 }
 
 terraform {
