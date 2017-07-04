@@ -1,0 +1,89 @@
+# vim:ft=ansible
+---
+  - hosts: localhost
+    connection: local
+    gather_facts: False
+    vars:
+      region: "us-east-1"
+      vpcid: "vpc-d4eb24b2"
+      subnetid: "subnet-42235a0b"
+      file: "devops/index.html"
+      image: "ami-66073f70"
+      count: 1
+      bucketname: "jdir-devops"
+      securitygroup: "sg-6127bc19"
+      instancetype: "t2.micro"
+      keypair: "devops"
+      webappsdir: "/var/www/html/"
+
+    tasks:
+      - name: Download file
+        s3:
+             bucket: "{{ bucketname }}"
+             object: "{{ file }}"
+             dest: "./files/{{ file }}"
+             mode: get
+             region: "us-east-1"
+        tags:
+          - html
+
+      - name: Start the prototype
+        shell: aws ec2 run-instances --image-id "{{ image}}" --count {{ count }} --instance-type "{{ instancetype}}" --key-name "{{ keypair}}" --query 'Instances[*].InstanceId' --output text
+        register: instanceid
+      
+      - debug: var=instanceid
+
+      - name: ec2 wait instance-running
+        shell: aws ec2 wait instance-running --instance-ids "{{ instanceid.stdout }}"
+
+      - name: Get pub ip
+        shell: aws ec2 describe-instances --instance-ids "{{ instanceid.stdout }}" --query 'Reservations[*].Instances[*].PublicIpAddress' --output text
+        register: pubip
+
+      - debug: var=pubip
+
+      - add_host:
+          name: "{{ pubip }}"
+          groups: liveserver
+
+  - hosts: liveserver
+    gather_facts: False
+    tasks:
+      - name: Copy file to web server
+        win_copy:
+            src: "./files/{{ file }}"
+            dest: "{{ webappsdir }}"
+        tags:
+          - html
+
+  - hosts: localhost
+    connection: local
+    gather_facts: False
+    tasks:
+
+      - name: Stop the instance, for creating the image
+        shell: aws ec2 stop-instances --instance-ids "{{ instanceid }}"
+
+      - name: Wait for instance to shutdown
+        pause:
+          minutes: 1
+
+      - name: ec2 wait instance-stopped
+        shell: aws ec2 wait instance-stopped --instance-ids "{{ instanceid }}"
+
+      - name: Bake AMI
+        shell: aws ec2 create-image --instance-id "{{ instanceid }}" --name "{{lookup('pipe','date +%Y%m%d%H%M%S')}}" --output text
+        register: newami
+
+      - debug: msg={{ (newami.stdout | from_json).ImageId }}
+
+      - name: "AWS Create-Image called, waiting for new AMI to be ready"
+        pause:
+          minutes: 5
+
+      - name: Wait for new ami
+        command: aws ec2 wait image-available --image-ids {{ newami }}
+
+      - name: Terraform plan
+        command: terragrunt plan -var {{ newami }} -no-color
+
